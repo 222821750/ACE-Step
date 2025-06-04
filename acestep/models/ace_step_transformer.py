@@ -104,7 +104,7 @@ class T2IFinalLayer(nn.Module):
         self.scale_shift_table = nn.Parameter(
             torch.randn(2, hidden_size) / hidden_size**0.5
         )
-        self.out_channels = out_channels
+        self.out_channels = out_channels    # 8
         self.patch_size = patch_size
 
     def unpatchfy(
@@ -113,7 +113,7 @@ class T2IFinalLayer(nn.Module):
         width: int,
     ):
         # 4 unpatchify
-        new_height, new_width = 1, hidden_states.size(1)
+        new_height, new_width = 1, hidden_states.size(1)    # 1, 1776
         hidden_states = hidden_states.reshape(
             shape=(
                 hidden_states.shape[0],
@@ -123,8 +123,8 @@ class T2IFinalLayer(nn.Module):
                 self.patch_size[1],
                 self.out_channels,
             )
-        ).contiguous()
-        hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
+        ).contiguous()  # torch.Size([1, 1776, 128]) -> torch.Size([1, 1, 1776, 16, 1, 8])
+        hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)   # torch.Size([1, 8, 1, 16, 1776, 1])
         output = hidden_states.reshape(
             shape=(
                 hidden_states.shape[0],
@@ -132,7 +132,7 @@ class T2IFinalLayer(nn.Module):
                 new_height * self.patch_size[0],
                 new_width * self.patch_size[1],
             )
-        ).contiguous()
+        ).contiguous()  # torch.Size([1, 8, 16, 1776])
         if width > new_width:
             output = torch.nn.functional.pad(
                 output, (0, width - new_width, 0, 0), "constant", 0
@@ -142,11 +142,14 @@ class T2IFinalLayer(nn.Module):
         return output
 
     def forward(self, x, t, output_length):
-        shift, scale = (self.scale_shift_table[None] + t[:, None]).chunk(2, dim=1)
-        x = t2i_modulate(self.norm_final(x), shift, scale)
-        x = self.linear(x)
+        # x: torch.Size([1, 1776, 2560]), t: torch.Size([1, 2560]), output_length: 1776
+
+        # self.scale_shift_table: torch.Size([2, 2560])
+        shift, scale = (self.scale_shift_table[None] + t[:, None]).chunk(2, dim=1)  #  torch.Size([1, 1, 2560]) x 2
+        x = t2i_modulate(self.norm_final(x), shift, scale)      # x * (1 + scale) + shift
+        x = self.linear(x)  # torch.Size([1, 1776, 128])
         # unpatchify
-        output = self.unpatchfy(x, output_length)
+        output = self.unpatchfy(x, output_length)   # torch.Size([1, 8, 16, 1776])
         return output
 
 
@@ -190,7 +193,7 @@ class PatchEmbed(nn.Module):
         self.base_size = self.width
 
     def forward(self, latent):
-        # early convolutions, N x C x H x W -> N x 256 * sqrt(patch_size) x H/patch_size x W/patch_size
+        # early convolutions, N x C x H x W -> N x embed_dim x H/patch_size x W/patch_size
         latent = self.early_conv_layers(latent)
         latent = latent.flatten(2).transpose(1, 2)  # BCHW -> BNC
         return latent
@@ -206,6 +209,31 @@ class Transformer2DModelOutput(BaseOutput):
 class ACEStepTransformer2DModel(
     ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin
 ):
+    """
+    ACE-STEP Transformer 2D 模型，支持多模态输入（说话人、体裁、歌词、SSL 特征等），
+    用于大规模序列建模与多任务学习，适用于语音、文本等多种输入场景。
+
+    主要功能：
+    - 支持旋转位置编码（RoPE）、多层 Transformer 块、时间步嵌入、
+    说话人/体裁/歌词嵌入与编码、SSL 投影器、Patch 嵌入、最终输出层等模块。
+    - 支持多模态输入，灵活融合说话人、体裁、歌词、SSL 特征等信息。
+    - 支持大规模序列建模，适用于长序列输入。
+    - 支持 REPA 投影损失，可与 SSL 特征对齐，提升多任务学习能力。
+    - 支持梯度检查点（gradient checkpointing）与前向分块（forward chunking），优化显存与计算效率。
+    - 兼容 ControlNet 条件控制，支持条件生成任务。
+
+    参数说明（部分）：
+
+    主要方法：
+    - enable_forward_chunking: 启用前向分块，提高大模型推理效率。
+    - forward_lyric_encoder: 歌词编码器前向过程。
+    - encode: 编码器部分，融合说话人、体裁、歌词等多模态信息。
+    - decode: 解码器部分，支持 REPA 投影损失与 ControlNet 条件控制。
+    - forward: 模型整体前向过程，集成编码与解码。
+
+    返回：
+        Transformer2DModelOutput 或 Tuple，包含最终输出与各 SSL 分支的投影损失。
+    """
     _supports_gradient_checkpointing = True
 
     @register_to_config
@@ -232,12 +260,40 @@ class ACEStepTransformer2DModel(
         max_width: int = 4096,
         **kwargs,
     ):
+        """
+        初始化 ACE-STEP Transformer 模型。
+        参数:
+            in_channels (Optional[int]): 输入通道数，默认为 8。
+            num_layers (int): Transformer 层数，默认为 28。
+            inner_dim (int): Transformer 内部特征维度，默认为 1536。
+            attention_head_dim (int): 每个注意力头的维度，默认为 64。
+            num_attention_heads (int): 注意力头数量，默认为 24。
+            mlp_ratio (float): MLP 层扩展比例，默认为 4.0。
+            out_channels (int): 输出通道数，默认为 8。
+            max_position (int): 最大位置编码长度，默认为 32768。
+            rope_theta (float): Rotary Embedding 的 theta 参数，默认为 1000000.0。
+            speaker_embedding_dim (int): 说话人嵌入维度，默认为 512。
+            text_embedding_dim (int): 文本嵌入维度，默认为 768。
+            ssl_encoder_depths (List[int]): SSL 使用的深度列表，默认为 [9, 9]。
+            ssl_names (List[str]): SSL 模型名称列表，默认为 ["mert", "m-hubert"]。
+            ssl_latent_dims (List[int]): SSL 潜在特征维度列表，默认为 [1024, 768]。
+            lyric_encoder_vocab_size (int): 歌词编码器词表大小，默认为 6681。
+            lyric_hidden_size (int): 歌词隐藏层维度，默认为 1024。
+            patch_size (List[int]): Patch 大小，默认为 [16, 1]。
+            max_height (int): 输入最大高度，默认为 16。
+            max_width (int): 输入最大宽度，默认为 4096。
+            **kwargs: 其他可选参数。
+        功能:
+            - 初始化模型的各个子模块，包括旋转位置编码、Transformer 块、时间步嵌入、
+            说话人/体裁/歌词嵌入与编码、SSL 投影器、Patch 嵌入、最终输出层等。
+            - 支持多模态输入（如说话人、体裁、歌词、SSL 特征等）。
+        """
         super().__init__()
 
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         inner_dim = num_attention_heads * attention_head_dim
-        self.inner_dim = inner_dim
+        self.inner_dim = inner_dim  # 2560
         self.out_channels = out_channels
         self.max_position = max_position
         self.patch_size = patch_size
@@ -275,6 +331,7 @@ class ACEStepTransformer2DModel(
         self.timestep_embedder = TimestepEmbedding(
             in_channels=256, time_embed_dim=self.inner_dim
         )
+        # adaLN single，timestep embedding每层共享
         self.t_block = nn.Sequential(
             nn.SiLU(), nn.Linear(self.inner_dim, 6 * self.inner_dim, bias=True)
         )
@@ -282,10 +339,11 @@ class ACEStepTransformer2DModel(
         # speaker
         self.speaker_embedder = nn.Linear(speaker_embedding_dim, self.inner_dim)
 
-        # genre
+        # genre, 投影embedding的维度到inner_dim
+        # Linear(in_features=768, out_features=2560, bias=True)
         self.genre_embedder = nn.Linear(text_embedding_dim, self.inner_dim)
 
-        # lyric
+        # lyric, token需要经过encoder
         self.lyric_embs = nn.Embedding(lyric_encoder_vocab_size, lyric_hidden_size)
         self.lyric_encoder = LyricEncoder(
             input_size=lyric_hidden_size, static_chunk_size=0
@@ -294,6 +352,7 @@ class ACEStepTransformer2DModel(
 
         projector_dim = 2 * self.inner_dim
 
+        # 用于计算REPA的投影器，每个SSL模型对应一个投影器
         self.projectors = nn.ModuleList(
             [
                 nn.Sequential(
@@ -310,9 +369,11 @@ class ACEStepTransformer2DModel(
         self.ssl_latent_dims = ssl_latent_dims
         self.ssl_encoder_depths = ssl_encoder_depths
 
+        # 用于REPA损失计算
         self.cosine_loss = torch.nn.CosineEmbeddingLoss(margin=0.0, reduction="mean")
         self.ssl_names = ssl_names
 
+        # 使用卷积层将输入的mel图转换为patch embedding，把高度从16卷成1以变成序列
         self.proj_in = PatchEmbed(
             height=max_height,
             width=max_width,
@@ -321,6 +382,7 @@ class ACEStepTransformer2DModel(
             bias=True,
         )
 
+        # 从序列变成图像，从通道维度取出高度
         self.final_layer = T2IFinalLayer(
             self.inner_dim, patch_size=patch_size, out_channels=out_channels
         )
@@ -366,11 +428,11 @@ class ACEStepTransformer2DModel(
         lyric_mask: Optional[torch.LongTensor] = None,
     ):
         # N x T x D
-        lyric_embs = self.lyric_embs(lyric_token_idx)
+        lyric_embs = self.lyric_embs(lyric_token_idx)   # (b, token_len) -> (b, token_len, lyric_hidden_size)
         prompt_prenet_out, _mask = self.lyric_encoder(
             lyric_embs, lyric_mask, decoding_chunk_size=1, num_decoding_left_chunks=-1
-        )
-        prompt_prenet_out = self.lyric_proj(prompt_prenet_out)
+        )   # (b, token_len, lyric_hidden_size)
+        prompt_prenet_out = self.lyric_proj(prompt_prenet_out)  # (b, token_len, lyric_hidden_size) -> (b, token_len, inner_dim)
         return prompt_prenet_out
 
     def encode(
@@ -382,23 +444,23 @@ class ACEStepTransformer2DModel(
         lyric_mask: Optional[torch.LongTensor] = None,
     ):
 
-        bs = encoder_text_hidden_states.shape[0]
+        bs = encoder_text_hidden_states.shape[0]    # 1
         device = encoder_text_hidden_states.device
 
         # speaker embedding
-        encoder_spk_hidden_states = self.speaker_embedder(speaker_embeds).unsqueeze(1)
-        speaker_mask = torch.ones(bs, 1, device=device)
+        encoder_spk_hidden_states = self.speaker_embedder(speaker_embeds).unsqueeze(1)  # torch.Size([1, 1, 2560])
+        speaker_mask = torch.ones(bs, 1, device=device) # torch.Size([1, 1])
 
         # genre embedding
-        encoder_text_hidden_states = self.genre_embedder(encoder_text_hidden_states)
+        encoder_text_hidden_states = self.genre_embedder(encoder_text_hidden_states)    # # torch.Size([1, 41, 768]) -> torch.Size([1, 41, 2560])
 
         # lyric
-        encoder_lyric_hidden_states = self.forward_lyric_encoder(
+        encoder_lyric_hidden_states = self.forward_lyric_encoder(       # torch.Size([1, 468, 2560])
             lyric_token_idx=lyric_token_idx,
             lyric_mask=lyric_mask,
         )
 
-        encoder_hidden_states = torch.cat(
+        encoder_hidden_states = torch.cat(      # torch.Size([1, 510, 2560])
             [
                 encoder_spk_hidden_states,
                 encoder_text_hidden_states,
@@ -426,13 +488,34 @@ class ACEStepTransformer2DModel(
         controlnet_scale: Union[float, torch.Tensor] = 1.0,
         return_dict: bool = True,
     ):
+        """
+        解码器函数，用于处理输入的隐藏状态、注意力掩码、编码器隐藏状态等，生成最终输出。
 
+        参数:
+            hidden_states (torch.Tensor): 解码器输入的隐藏状态张量。
+            attention_mask (torch.Tensor): 解码器自注意力掩码。
+            encoder_hidden_states (torch.Tensor): 编码器输出的隐藏状态张量。
+            encoder_hidden_mask (torch.Tensor): 编码器注意力掩码。
+            timestep (Optional[torch.Tensor]): 当前时间步张量，用于时间嵌入。
+            ssl_hidden_states (Optional[List[torch.Tensor]]): 可选，来自SSL编码器的隐藏状态列表，用于投影损失计算。
+            output_length (int): 输出序列长度。
+            block_controlnet_hidden_states (Optional[Union[List[torch.Tensor], torch.Tensor]]): 
+                可选，ControlNet隐藏状态，用于条件控制。
+            controlnet_scale (Union[float, torch.Tensor]): ControlNet条件缩放系数。
+            return_dict (bool): 是否以字典形式返回结果。
+
+        返回:
+            Transformer2DModelOutput 或 Tuple:
+                - sample (torch.Tensor): 解码器最终输出。
+                - proj_losses (List[Tuple[str, torch.Tensor]]): 各SSL分支的投影损失（如有）。
+        """
         embedded_timestep = self.timestep_embedder(
             self.time_proj(timestep).to(dtype=hidden_states.dtype)
-        )
-        temb = self.t_block(embedded_timestep)
+        )   # torch.Size([1, 2560])
+        temb = self.t_block(embedded_timestep)  # torch.Size([1, 2560x6])
 
-        hidden_states = self.proj_in(hidden_states)
+        # 使用卷积将输入的mel图hidden_states转换为patch embedding
+        hidden_states = self.proj_in(hidden_states)     # torch.Size([1, 8, 16, 1776]) -> torch.Size([1, 1776, 2560])
 
         # controlnet logic
         if block_controlnet_hidden_states is not None:
@@ -441,12 +524,13 @@ class ACEStepTransformer2DModel(
 
         inner_hidden_states = []
 
+        # ROPE pos emb
         rotary_freqs_cis = self.rotary_emb(
             hidden_states, seq_len=hidden_states.shape[1]
-        )
+        )   # torch.Size([1776, 128]) x 2, attention_head_dim=128
         encoder_rotary_freqs_cis = self.rotary_emb(
             encoder_hidden_states, seq_len=encoder_hidden_states.shape[1]
-        )
+        )   # torch.Size([510, 128]) x 2
 
         for index_block, block in enumerate(self.transformer_blocks):
 
@@ -462,7 +546,7 @@ class ACEStepTransformer2DModel(
                     rotary_freqs_cis_cross=encoder_rotary_freqs_cis,
                     temb=temb,
                     use_reentrant=False,
-                )
+                )   # torch.Size([1, 1776, 2560])
 
             else:
                 hidden_states = block(
@@ -473,33 +557,41 @@ class ACEStepTransformer2DModel(
                     rotary_freqs_cis=rotary_freqs_cis,
                     rotary_freqs_cis_cross=encoder_rotary_freqs_cis,
                     temb=temb,
-                )
+                )   # torch.Size([1, 1776, 2560])
 
-            for ssl_encoder_depth in self.ssl_encoder_depths:
-                if index_block == ssl_encoder_depth:
+            # 每个SSL模型需要保存一个特定的中间层hidden_states
+            for ssl_encoder_depth in self.ssl_encoder_depths:   # [8, 8]
+                if index_block == ssl_encoder_depth:    # 判断是否是指定的中间层
                     inner_hidden_states.append(hidden_states)
 
+        # REPA部分，将中间层的hidden_states进行投影后，与ssl_hidden_states计算cosine损失
         proj_losses = []
         if (
             len(inner_hidden_states) > 0
             and ssl_hidden_states is not None
             and len(ssl_hidden_states) > 0
         ):
-
+            # 对每个SSL模型分别进行计算
             for inner_hidden_state, projector, ssl_hidden_state, ssl_name in zip(
                 inner_hidden_states, self.projectors, ssl_hidden_states, self.ssl_names
             ):
                 if ssl_hidden_state is None:
                     continue
-                # 1. N x T x D1 -> N x D x D2
+                # 1. N x T x D1 -> N x T x D2
+                # N： batch size
+                # T： sequence length
+                # D1： inner hidden state dim
+                # D2： ssl hidden state dim
                 est_ssl_hidden_state = projector(inner_hidden_state)
                 # 3. projection loss
                 bs = inner_hidden_state.shape[0]
                 proj_loss = 0.0
+                # 提取出每个batch分别进行计算
                 for i, (z, z_tilde) in enumerate(
                     zip(ssl_hidden_state, est_ssl_hidden_state)
                 ):
                     # 2. interpolate
+                    # 将sequence length线性插值到SSL的sequence length
                     z_tilde = (
                         F.interpolate(
                             z_tilde.unsqueeze(0).transpose(1, 2),
@@ -516,9 +608,9 @@ class ACEStepTransformer2DModel(
                     # T x d -> T x 1 -> 1
                     target = torch.ones(z.shape[0], device=z.device)
                     proj_loss += self.cosine_loss(z, z_tilde, target)
-                proj_losses.append((ssl_name, proj_loss / bs))
+                proj_losses.append((ssl_name, proj_loss / bs))  # 用batch size平均损失
 
-        output = self.final_layer(hidden_states, embedded_timestep, output_length)
+        output = self.final_layer(hidden_states, embedded_timestep, output_length)  # torch.Size([1, 8, 16, 1776])
         if not return_dict:
             return (output, proj_losses)
 

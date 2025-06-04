@@ -130,6 +130,32 @@ class ConvLayer(nn.Module):
 
 
 class GLUMBConv(nn.Module):
+    """
+    GLUMBConv 模块实现了一种基于门控线性单元(GLU)的多分支卷积结构。
+
+    参数:
+        in_features (int): 输入特征通道数。
+        hidden_features (int): 隐藏层特征通道数。
+        out_feature (int, 可选): 输出特征通道数，默认为输入通道数。
+        kernel_size (int): 深度卷积的卷积核大小，默认3。
+        stride (int): 深度卷积的步幅，默认1。
+        padding (int 或 None): 深度卷积的填充，默认None。
+        use_bias (bool 或 tuple): 每层卷积是否使用偏置，支持单个bool或长度为3的tuple。
+        norm (str 或 tuple): 每层卷积的归一化类型，支持单个字符串或长度为3的tuple。
+        act (str 或 tuple): 每层卷积的激活函数类型，支持单个字符串或长度为3的tuple。
+        dilation (int): 深度卷积的扩张率，默认1。
+
+    前向过程:
+        1. 输入张量先在通道和序列维度进行转置。
+        2. 经过1x1卷积(inverted_conv)扩展通道数为hidden_features*2。
+        3. 经过深度卷积(depth_conv)。
+        4. 通道维度一分为二，一部分作为主分支，一部分经过SiLU激活作为门控分支，两者相乘实现GLU门控。
+        5. 经过1x1卷积(point_conv)还原或变换通道数。
+        6. 最后转置回原始维度顺序。
+
+    返回:
+        torch.Tensor: 输出特征张量，形状与输入一致或通道数为out_feature。
+    """
     def __init__(
         self,
         in_features: int,
@@ -196,7 +222,38 @@ class GLUMBConv(nn.Module):
 
 class LinearTransformerBlock(nn.Module):
     """
-    A Sana block with global shared adaptive layer norm (adaLN-single) conditioning.
+    LinearTransformerBlock 是一个基于线性变换的 Transformer 块，支持自适应层归一化（adaLN-single）条件化。
+
+    参数:
+        dim (int): 输入特征维度。
+        num_attention_heads (int): 注意力头的数量。
+        attention_head_dim (int): 每个注意力头的维度。
+        use_adaln_single (bool, 可选): 是否使用自适应层归一化（adaLN-single），默认为 True。
+        cross_attention_dim (int, 可选): 跨注意力的上下文特征维度。
+        added_kv_proj_dim (int, 可选): 额外的键值投影维度。
+        context_pre_only (bool, 可选): 是否仅在前置阶段使用上下文，默认为 False。
+        mlp_ratio (float, 可选): 前馈网络隐藏层与输入层的维度比，默认为 4.0。
+        add_cross_attention (bool, 可选): 是否添加跨注意力机制，默认为 False。
+        add_cross_attention_dim (int, 可选): 额外跨注意力的上下文特征维度。
+        qk_norm (可选): 查询和键的归一化方法。
+
+    前向传播参数:
+        hidden_states (torch.FloatTensor): 输入的隐藏状态，形状为 (batch, seq_len, dim)。
+        encoder_hidden_states (torch.FloatTensor, 可选): 编码器隐藏状态，用于跨注意力。
+        attention_mask (torch.FloatTensor, 可选): 注意力掩码。
+        encoder_attention_mask (torch.FloatTensor, 可选): 编码器注意力掩码。
+        rotary_freqs_cis (torch.Tensor 或 Tuple[torch.Tensor], 可选): 旋转位置编码参数。
+        rotary_freqs_cis_cross (torch.Tensor 或 Tuple[torch.Tensor], 可选): 跨注意力的旋转位置编码参数。
+        temb (torch.FloatTensor, 可选): 条件化的时间嵌入。
+
+    返回:
+        torch.FloatTensor: 经过 Transformer 块处理后的隐藏状态。
+
+    功能说明:
+        - 支持自适应层归一化（adaLN-single）条件化。
+        - 包含自注意力和可选的跨注意力机制。
+        - 集成前馈网络（GLUMBConv）。
+        - 支持旋转位置编码和多种归一化方式。
     """
 
     def __init__(

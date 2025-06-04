@@ -180,6 +180,7 @@ class CustomLiteLAProcessor2_0:
                 0, 1, 3, 2
             )  # [B, h, D, S_enc] * [B, 1, 1, S_enc]
 
+        # linear attn前，先使用简单的非线性函数保证非负性
         query = self.kernel_func(query)
         key = self.kernel_func(key)
 
@@ -187,13 +188,14 @@ class CustomLiteLAProcessor2_0:
 
         value = F.pad(value, (0, 0, 0, 1), mode="constant", value=self.pad_val)
 
-        vk = torch.matmul(value, key)
+        vk = torch.matmul(value, key)   # [B, H, D+1, S] * [B, H, S, D] = [B, H, D+1, D]
 
-        hidden_states = torch.matmul(vk, query)
+        hidden_states = torch.matmul(vk, query) # [B, H, D+1, D] * [B, H, D, S] = [B, H, D+1, S]
 
         if hidden_states.dtype in [torch.float16, torch.bfloat16]:
             hidden_states = hidden_states.float()
 
+        # linear attention: Q*((K^T)*V) / Q*((K^T)*1)
         hidden_states = hidden_states[:, :, :-1] / (hidden_states[:, :, -1:] + self.eps)
 
         hidden_states = hidden_states.view(

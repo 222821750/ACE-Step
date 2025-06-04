@@ -92,6 +92,49 @@ REPO_ID_QUANT = REPO_ID + "-q4-K-M" # ??? update this i guess
 
 # class ACEStepPipeline(DiffusionPipeline):
 class ACEStepPipeline:
+    """
+    ACEStepPipeline类
+    该类实现了ACE-STEP音乐生成管道，支持文本到音乐、音频编辑、音频到音频等多种任务。其核心功能包括
+    模型加载、推理、音频生成、歌词分词、种子设置、LoRA权重加载等。主要特点如下：
+    属性:
+        checkpoint_dir (str): 检查点目录路径。
+        device (torch.device): 当前推理所用设备（CPU/GPU/MPS）。
+        dtype (torch.dtype): 使用的数据类型（bfloat16/float32/float16）。
+        loaded (bool): 是否已加载模型权重。
+        torch_compile (bool): 是否启用torch.compile加速。
+        cpu_offload (bool): 是否将模型部分权重卸载到CPU。
+        quantized (bool): 是否加载量化模型。
+        overlapped_decode (bool): 是否启用重叠解码以支持长音频生成。
+        lora_path (str): 当前加载的LoRA权重路径。
+    主要方法:
+        __init__(...): 初始化管道，设置设备、数据类型、检查点路径等。
+        cleanup_memory(): 清理GPU和CPU内存，防止多次生成时显存溢出。
+        get_checkpoint_path(checkpoint_dir, repo): 获取或下载模型权重路径。
+        load_checkpoint(checkpoint_dir, export_quantized_weights): 加载模型权重。
+        load_quantized_checkpoint(checkpoint_dir): 加载量化模型权重。
+        get_text_embeddings(texts, text_max_length): 获取文本编码器的embedding。
+        get_text_embeddings_null(...): 获取弱化后的文本embedding（用于ERG）。
+        set_seeds(batch_size, manual_seeds): 设置随机种子，支持批量。
+        get_lang(text): 检测文本语言。
+        tokenize_lyrics(lyrics, debug): 歌词分词与token化。
+        calc_v(...): 计算扩散过程中的噪声预测（支持CFG/APG）。
+        flowedit_diffusion_process(...): 编辑任务的扩散采样流程。
+        add_latents_noise(...): 给定潜变量添加噪声（用于audio2audio）。
+        text2music_diffusion_process(...): 文本到音乐的扩散采样主流程。
+        latents2audio(latents, ...): 潜变量解码为音频并保存。
+        save_wav_file(...): 保存音频文件到磁盘。
+        infer_latents(input_audio_path): 推理音频文件的潜变量。
+        load_lora(lora_name_or_path, lora_weight): 加载LoRA权重。
+        __call__(...): 管道主入口，支持text2music、edit、audio2audio、retake等任务，返回生成音频路径及参数信息。
+    用法示例:
+        pipeline = ACEStepPipeline(...)
+        output_paths = pipeline(prompt="一段描述", lyrics="歌词内容", ...)
+    注意事项:
+    - 支持多种推理任务，参数丰富，适合音乐生成、编辑、重绘等场景。
+    - 支持LoRA微调权重加载与切换。
+    - 支持量化模型推理，节省显存。
+    - 生成结果包含音频文件及输入参数JSON，便于复现。
+    """
     def __init__(
         self,
         checkpoint_dir=None,
@@ -361,6 +404,22 @@ class ACEStepPipeline:
             self.text_encoder_model.to(self.device)
 
         def forward_with_temperature(inputs, tau=0.01, l_min=8, l_max=10):
+            """
+            对指定的 Transformer 编码器层应用温度缩放（temperature scaling），调整自注意力查询（SelfAttention.q）的输出。
+
+            参数:
+                inputs (dict): 输入到 text_encoder_model 的输入字典，通常包含 token_ids、attention_mask 等。
+                tau (float, 可选): 温度缩放系数，默认为 0.01。较小的 tau 会使分布更加平滑。
+                l_min (int, 可选): 需要应用温度缩放的起始层索引（包含），默认为 8。
+                l_max (int, 可选): 需要应用温度缩放的结束层索引（不包含），默认为 10。
+
+            返回:
+                torch.Tensor: 编码器最后一层的隐藏状态（last_hidden_state）。
+
+            注意事项:
+                - 该函数会临时注册前向钩子（forward hook）到指定的编码器层，并在前向传播后移除钩子。
+                - 前向传播过程中不计算梯度（torch.no_grad）。
+            """
             handlers = []
 
             def hook(module, input, output):
@@ -454,8 +513,9 @@ class ACEStepPipeline:
                 lang = "es"
 
             try:
+                # judge if the line is structured (e.g., "[Verse]", "[Chorus]")
                 if structure_pattern.match(line):
-                    token_idx = self.lyric_tokenizer.encode(line, "en")
+                    token_idx = self.lyric_tokenizer.encode(line, "en") # use English tokenizer for structured lyrics label
                 else:
                     token_idx = self.lyric_tokenizer.encode(line, lang)
                 if debug:
@@ -887,7 +947,7 @@ class ACEStepPipeline:
                 shift=3.0,
             )
 
-        frame_length = int(duration * 44100 / 512 / 8)
+        frame_length = int(duration * 44100 / 512 / 8)  # seq_len
         if src_latents is not None:
             frame_length = src_latents.shape[-1]
         
@@ -930,7 +990,7 @@ class ACEStepPipeline:
             generator=random_generators,
             device=self.device,
             dtype=self.dtype,
-        )
+        )   # torch.Size([1, 8, 16, 1776])
 
         is_repaint = False
         is_extend = False
@@ -1064,15 +1124,16 @@ class ACEStepPipeline:
                 infer_steps=infer_steps,
             )
 
-        attention_mask = torch.ones(bsz, frame_length, device=self.device, dtype=self.dtype)
+        attention_mask = torch.ones(bsz, frame_length, device=self.device, dtype=self.dtype)    # torch.Size([1, 1776])
 
         # guidance interval
         start_idx = int(num_inference_steps * ((1 - guidance_interval) / 2))
         end_idx = int(num_inference_steps * (guidance_interval / 2 + 0.5))
         logger.info(
-            f"start_idx: {start_idx}, end_idx: {end_idx}, num_inference_steps: {num_inference_steps}"
+            f"start_idx: {start_idx}, end_idx: {end_idx}, num_inference_steps: {num_inference_steps}"   # 6, 20, 27
         )
 
+        # ACP，使用动量的形式优化引导生成方向
         momentum_buffer = MomentumBuffer()
 
         def forward_encoder_with_temperature(self, inputs, tau=0.01, l_min=4, l_max=6):
@@ -1097,18 +1158,21 @@ class ACEStepPipeline:
 
             return encoder_hidden_states
 
+        # 得到speaker, text, lyric编码后的token并拼接在一起
         # P(speaker, text, lyric)
-        encoder_hidden_states, encoder_hidden_mask = self.ace_step_transformer.encode(
-            encoder_text_hidden_states,
-            text_attention_mask,
-            speaker_embds,
-            lyric_token_ids,
-            lyric_mask,
+        encoder_hidden_states, encoder_hidden_mask = self.ace_step_transformer.encode(      # encoder_hidden_state: storch.Size([1, 510, 2560])
+            encoder_text_hidden_states,     # torch.Size([1, 41, 768])
+            text_attention_mask,       # torch.Size([1, 41])
+            speaker_embds,           # torch.Size([1, 512])
+            lyric_token_ids,     # torch.Size([1, 468])
+            lyric_mask,         # torch.Size([1, 468])
         )
 
+        # 无条件引导，全部条件均为空
         if use_erg_lyric:
+            # 对lyric使用ERG，正常传入lyric但对lyric的编码器的计算进行低温缩放
             # P(null_speaker, text_weaker, lyric_weaker)
-            encoder_hidden_states_null = forward_encoder_with_temperature(
+            encoder_hidden_states_null = forward_encoder_with_temperature(      # torch.Size([1, 510, 2560])
                 self,
                 inputs={
                     "encoder_text_hidden_states": (
@@ -1123,6 +1187,7 @@ class ACEStepPipeline:
                 },
             )
         else:
+            # 不使用ERG，普通CFG的无条件引导
             # P(null_speaker, null_text, null_lyric)
             encoder_hidden_states_null, _ = self.ace_step_transformer.encode(
                 torch.zeros_like(encoder_text_hidden_states),
@@ -1133,6 +1198,7 @@ class ACEStepPipeline:
             )
 
         encoder_hidden_states_no_lyric = None
+        # 双条件引导：增加给标签条件、不给lyric条件的引导
         if do_double_condition_guidance:
             # P(null_speaker, text, lyric_weaker)
             if use_erg_lyric:
@@ -1196,7 +1262,7 @@ class ACEStepPipeline:
                     logger.info(f"repaint start from {n_min} add {t_i} level of noise")
 
             # expand the latents if we are doing classifier free guidance
-            latents = target_latents
+            latents = target_latents    # torch.Size([1, 8, 16, 1776])
 
             is_in_guidance_interval = start_idx <= i < end_idx
             if is_in_guidance_interval and do_classifier_free_guidance:
@@ -1215,7 +1281,7 @@ class ACEStepPipeline:
                 else:
                     current_guidance_scale = guidance_scale
 
-                latent_model_input = latents
+                latent_model_input = latents    # torch.Size([1, 8, 16, 1776])
                 timestep = t.expand(latent_model_input.shape[0])
                 output_length = latent_model_input.shape[-1]
                 # P(x|speaker, text, lyric)
@@ -1226,7 +1292,7 @@ class ACEStepPipeline:
                     encoder_hidden_mask=encoder_hidden_mask,
                     output_length=output_length,
                     timestep=timestep,
-                ).sample
+                ).sample    # torch.Size([1, 8, 16, 1776])
 
                 noise_pred_with_only_text_cond = None
                 if (
@@ -1326,7 +1392,7 @@ class ACEStepPipeline:
                 )
             else:
                 target_latents = scheduler.step(
-                    model_output=noise_pred,
+                    model_output=noise_pred,    # torch.Size([1, 8, 16, 1776])
                     timestep=t,
                     sample=target_latents,
                     return_dict=False,
@@ -1361,7 +1427,7 @@ class ACEStepPipeline:
             if self.overlapped_decode and target_wav_duration_second > 48:
                 _, pred_wavs = self.music_dcae.decode_overlap(pred_latents, sr=sample_rate)
             else:
-                _, pred_wavs = self.music_dcae.decode(pred_latents, sr=sample_rate)
+                _, pred_wavs = self.music_dcae.decode(pred_latents, sr=sample_rate)     # pred_wavs: List[torch.Size([2, 1836792]), ]
         pred_wavs = [pred_wav.cpu().float() for pred_wav in pred_wavs]
         for i in tqdm(range(bs)):
             output_audio_path = self.save_wav_file(
@@ -1406,10 +1472,10 @@ class ACEStepPipeline:
     def infer_latents(self, input_audio_path):
         if input_audio_path is None:
             return None
-        input_audio, sr = self.music_dcae.load_audio(input_audio_path)
+        input_audio, sr = self.music_dcae.load_audio(input_audio_path)  # sr: 44100 Hz, input_audio: torch.Size([2, sr * 歌曲秒数])
         input_audio = input_audio.unsqueeze(0)
         input_audio = input_audio.to(device=self.device, dtype=self.dtype)
-        latents, _ = self.music_dcae.encode(input_audio, sr=sr)
+        latents, _ = self.music_dcae.encode(input_audio, sr=sr)     # latents: torch.Size([1, 8, 16, sr * 歌曲秒数 / 512 / 8])
         return latents
 
     def load_lora(self, lora_name_or_path, lora_weight):
@@ -1499,31 +1565,33 @@ class ACEStepPipeline:
         else:
             oss_steps = []
 
+        # 风格标签
         texts = [prompt]
-        encoder_text_hidden_states, text_attention_mask = self.get_text_embeddings(texts)
-        encoder_text_hidden_states = encoder_text_hidden_states.repeat(batch_size, 1, 1)
-        text_attention_mask = text_attention_mask.repeat(batch_size, 1)
+        encoder_text_hidden_states, text_attention_mask = self.get_text_embeddings(texts)   # torch.Size([1, 41, 768]), torch.Size([1, 41])
+        encoder_text_hidden_states = encoder_text_hidden_states.repeat(batch_size, 1, 1)    # [1, 41, 768]
+        text_attention_mask = text_attention_mask.repeat(batch_size, 1)     # [1, 41]
 
         encoder_text_hidden_states_null = None
         if use_erg_tag:
-            encoder_text_hidden_states_null = self.get_text_embeddings_null(texts)
+            # 对标签使用ERG: 对注意力的查询进行低温缩放作为负面文本embedding
+            encoder_text_hidden_states_null = self.get_text_embeddings_null(texts)      # torch.Size([1, 41, 768])
             encoder_text_hidden_states_null = encoder_text_hidden_states_null.repeat(batch_size, 1, 1)
 
         # not support for released checkpoint
-        speaker_embeds = torch.zeros(batch_size, 512).to(self.device).to(self.dtype)
+        speaker_embeds = torch.zeros(batch_size, 512).to(self.device).to(self.dtype)    # torch.Size([1, 512])
 
         # 6 lyric
         lyric_token_idx = torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
         lyric_mask = torch.tensor([0]).repeat(batch_size, 1).to(self.device).long()
         if len(lyrics) > 0:
-            lyric_token_idx = self.tokenize_lyrics(lyrics, debug=debug)
+            lyric_token_idx = self.tokenize_lyrics(lyrics, debug=debug)     # token_num 468
             lyric_mask = [1] * len(lyric_token_idx)
             lyric_token_idx = (
                 torch.tensor(lyric_token_idx)
                 .unsqueeze(0)
                 .to(self.device)
                 .repeat(batch_size, 1)
-            )
+            )   # torch.Size([1, 468])
             lyric_mask = (
                 torch.tensor(lyric_mask)
                 .unsqueeze(0)
@@ -1546,7 +1614,7 @@ class ACEStepPipeline:
             repaint_end = audio_duration
 
         src_latents = None
-        if src_audio_path is not None:
+        if src_audio_path is not None:  # upload audio for repaint/extend/edit task
             assert src_audio_path is not None and task in (
                 "repaint",
                 "edit",
@@ -1624,7 +1692,7 @@ class ACEStepPipeline:
                 scheduler_type=scheduler_type,
             )
         else:
-            target_latents = self.text2music_diffusion_process(
+            target_latents = self.text2music_diffusion_process(     # torch.Size([1, 8, 16, 1776])
                 duration=audio_duration,
                 encoder_text_hidden_states=encoder_text_hidden_states,
                 text_attention_mask=text_attention_mask,
