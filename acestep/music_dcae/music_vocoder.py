@@ -490,7 +490,45 @@ class HiFiGANGenerator(nn.Module):
 
 
 class ADaMoSHiFiGANV1(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+    """
+    ADaMoSHiFiGANV1 音频生成模型
 
+    该类结合了 ConvNeXt 编码器和 HiFiGAN 生成器，用于从梅尔频谱图生成高质量音频波形。适用于音乐或语音的神经声码器任务。
+
+    参数:
+        input_channels (int): 输入通道数，默认为 128。
+        depths (List[int]): ConvNeXt 编码器每个阶段的深度，默认为 [3, 3, 9, 3]。
+        dims (List[int]): ConvNeXt 编码器每个阶段的通道数，默认为 [128, 256, 384, 512]。
+        drop_path_rate (float): Drop path 概率，默认为 0.0。
+        kernel_sizes (Tuple[int]): ConvNeXt 编码器卷积核大小，默认为 (7,)。
+        upsample_rates (Tuple[int]): HiFiGAN 生成器的上采样倍率，默认为 (4, 4, 2, 2, 2, 2, 2)。
+        upsample_kernel_sizes (Tuple[int]): 上采样卷积核大小，默认为 (8, 8, 4, 4, 4, 4, 4)。
+        resblock_kernel_sizes (Tuple[int]): 残差块卷积核大小，默认为 (3, 7, 11, 13)。
+        resblock_dilation_sizes (Tuple[Tuple[int]]): 残差块膨胀系数，默认为 ((1, 3, 5), ... )。
+        num_mels (int): 生成器输入的梅尔频率通道数，默认为 512。
+        upsample_initial_channel (int): 上采样初始通道数，默认为 1024。
+        use_template (bool): 是否使用模板，默认为 False。
+        pre_conv_kernel_size (int): 生成器前置卷积核大小，默认为 13。
+        post_conv_kernel_size (int): 生成器后置卷积核大小，默认为 13。
+        sampling_rate (int): 采样率，默认为 44100。
+        n_fft (int): FFT 点数，默认为 2048。
+        win_length (int): 窗口长度，默认为 2048。
+        hop_length (int): 帧移，默认为 512。
+        f_min (int): 最小频率，默认为 40。
+        f_max (int): 最大频率，默认为 16000。
+        n_mels (int): 梅尔频率通道数，默认为 128。
+
+    属性:
+        backbone: ConvNeXt 编码器，用于提取特征。
+        head: HiFiGAN 生成器，用于生成音频波形。
+        sampling_rate: 音频采样率。
+        mel_transform: LogMelSpectrogram 实例，用于将音频转换为梅尔频谱图。
+
+    方法:
+        decode(mel): 将梅尔频谱图解码为音频波形（无梯度）。
+        encode(x): 将音频编码为梅尔频谱图（无梯度）。
+        forward(mel): 前向传播，输入梅尔频谱图，输出音频波形。
+    """
     @register_to_config
     def __init__(
         self,

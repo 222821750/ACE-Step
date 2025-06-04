@@ -34,6 +34,44 @@ torch.set_float32_matmul_precision("high")
 
 
 class Pipeline(LightningModule):
+    """
+    Pipeline 是一个基于 PyTorch LightningModule 的文本到音乐生成模型训练模块。
+    它集成了文本编码器、音频编码器、SSL 模型（MERT、mHuBERT）等组件，并支持 LoRA 适配器高效微调。
+
+    属性:
+        transformers: 主扩散 Transformer 模型。
+        dcae: 音频编码/解码器。
+        text_encoder_model: 文本编码模型。
+        text_tokenizer: 文本分词器。
+        mert_model: 预训练 MERT SSL 模型。
+        hubert_model: 预训练 mHuBERT SSL 模型。
+        scheduler: 扩散调度器。
+        ssl_coeff: SSL 投影损失权重。
+        adapter_name: LoRA 适配器名称。
+
+    方法:
+        infer_mert_ssl(target_wavs, wav_lengths): 提取 MERT SSL 特征。
+        infer_mhubert_ssl(target_wavs, wav_lengths): 提取 mHuBERT SSL 特征。
+        get_text_embeddings(texts, device, text_max_length): 文本编码。
+        preprocess(batch, train): 预处理训练/推理批次。
+        get_scheduler(): 返回扩散调度器。
+        configure_optimizers(): 配置优化器与学习率调度。
+        train_dataloader(): 返回训练 DataLoader。
+        get_sd3_sigmas(timesteps, device, n_dim, dtype): 计算 SD3 扩散 sigmas。
+        get_timestep(bsz, device): 采样扩散步。
+        run_step(batch, batch_idx): 单步训练。
+        training_step(batch, batch_idx): Lightning 训练步。
+        on_save_checkpoint(checkpoint): 保存 LoRA 检查点。
+        diffusion_process(...): 推理扩散过程。
+        predict_step(batch): 批量推理。
+        construct_lyrics(candidate_lyric_chunk): 拼接歌词。
+        plot_step(batch, batch_idx): 定期保存评估结果。
+
+    说明:
+        - 依赖 PyTorch Lightning、torchaudio、peft（LoRA）。
+        - 支持 classifier-free guidance 与动量采样推理。
+        - 适用于大规模文本到音乐生成，支持 SSL 约束与条件生成。
+    """
     def __init__(
         self,
         learning_rate: float = 1e-4,
@@ -54,8 +92,31 @@ class Pipeline(LightningModule):
         lora_config_path: str = None,
         adapter_name: str = "lora_adapter",
     ):
+        """
+        初始化 Pipeline 类。
+
+        参数:
+            learning_rate (float): 优化器学习率。
+            num_workers (int): 数据加载的工作线程数。
+            train (bool): 是否为训练模式。
+            T (int): 扩散步数。
+            weight_decay (float): 优化器权重衰减。
+            every_plot_step (int): 每隔多少步保存评估结果。
+            shift (float): 扩散调度器 shift 参数。
+            logit_mean (float): logit-normal 步采样均值。
+            logit_std (float): logit-normal 步采样标准差。
+            timestep_densities_type (str): 步采样类型（如 "logit_normal"）。
+            ssl_coeff (float): SSL 投影损失系数。
+            checkpoint_dir (str 或 None): 检查点保存/加载目录。
+            max_steps (int): 最大训练步数。
+            warmup_steps (int): 学习率预热步数。
+            dataset_path (str): 训练集路径。
+            lora_config_path (str 或 None): LoRA 配置路径。
+            adapter_name (str): LoRA 适配器名称。
+        """
         super().__init__()
 
+        # 设置超参数
         self.save_hyperparameters()
         self.is_train = train
         self.T = T
@@ -65,11 +126,12 @@ class Pipeline(LightningModule):
 
         # step 1: load model
         acestep_pipeline = ACEStepPipeline(checkpoint_dir)
-        acestep_pipeline.load_checkpoint(acestep_pipeline.checkpoint_dir)
+        acestep_pipeline.load_checkpoint(acestep_pipeline.checkpoint_dir)   # load all model's checkpoint
 
         transformers = acestep_pipeline.ace_step_transformer.float().cpu()
         transformers.enable_gradient_checkpointing()
 
+        # 添加 LoRA 适配器
         assert lora_config_path is not None, "Please provide a LoRA config path"
         if lora_config_path is not None:
             try:
@@ -83,6 +145,7 @@ class Pipeline(LightningModule):
             transformers.add_adapter(adapter_config=lora_config, adapter_name=adapter_name)
             self.adapter_name = adapter_name
 
+        # 将模型从ACEStepPipeline中提取出来
         self.transformers = transformers
 
         self.dcae = acestep_pipeline.music_dcae.float().cpu()
@@ -95,6 +158,8 @@ class Pipeline(LightningModule):
         if self.is_train:
             self.transformers.train()
 
+            # 训练时需要用到MERT和mHuBERT模型，加载它们
+            # 首先加载MERT模型
             # download first
             try:
                 self.mert_model = AutoModel.from_pretrained(
@@ -130,6 +195,7 @@ class Pipeline(LightningModule):
                 "m-a-p/MERT-v1-330M", trust_remote_code=True
             )
 
+            # 然后加载mHuBERT模型
             self.hubert_model = AutoModel.from_pretrained("utter-project/mHuBERT-147").eval()
             self.hubert_model.requires_grad_(False)
             self.resampler_mhubert = torchaudio.transforms.Resample(
@@ -314,6 +380,31 @@ class Pipeline(LightningModule):
         return last_hidden_states, attention_mask
 
     def preprocess(self, batch, train=True):
+        """
+        对输入的 batch 数据进行预处理，生成模型训练或推理所需的各种特征和掩码。
+        包括音频特征提取、文本编码、说话人嵌入、歌词 token 处理等，并在训练时随机应用 classifier-free guidance（无条件引导）。
+
+        参数:
+            batch (dict): 包含音频、文本、说话人等信息的批量数据字典。
+            train (bool, 可选): 是否为训练模式。默认为 True。训练模式下会对部分条件进行随机 mask。
+
+        返回:
+            tuple: 包含以下内容的元组：
+                - keys: 样本的唯一标识符列表
+                - target_latents: 目标音频的潜在表示
+                - attention_mask: 用于目标潜在表示的注意力掩码
+                - encoder_text_hidden_states: 文本编码器输出的隐藏状态
+                - text_attention_mask: 文本注意力掩码
+                - speaker_embds: 说话人嵌入
+                - lyric_token_ids: 歌词 token id
+                - lyric_mask: 歌词掩码
+                - mert_ssl_hidden_states: MERT SSL 模型的隐藏状态（仅训练时返回）
+                - mhubert_ssl_hidden_states: mHuBERT SSL 模型的隐藏状态（仅训练时返回）
+
+        说明:
+            - 训练模式下会对文本、说话人、歌词等条件特征进行随机 mask，以增强模型鲁棒性。
+            - 支持自动混合精度（AMP）以提升推理效率。
+        """
         target_wavs = batch["target_wavs"]
         wav_lengths = batch["wav_lengths"]
 
@@ -322,6 +413,7 @@ class Pipeline(LightningModule):
         device = target_wavs.device
 
         # SSL constraints
+        # 推理出音频的 MERT 和 mHuBERT 特征
         mert_ssl_hidden_states = None
         mhubert_ssl_hidden_states = None
         if train:
@@ -331,13 +423,14 @@ class Pipeline(LightningModule):
                     target_wavs, wav_lengths
                 )
 
-        # 1: text embedding
+        # 编码风格标签
         texts = batch["prompts"]
         encoder_text_hidden_states, text_attention_mask = self.get_text_embeddings(
             texts, device
         )
         encoder_text_hidden_states = encoder_text_hidden_states.to(dtype)
 
+        # 将音频波形转换为mel图然后再编码
         target_latents, _ = self.dcae.encode(target_wavs, wav_lengths)
         attention_mask = torch.ones(
             bs, target_latents.shape[-1], device=device, dtype=dtype
@@ -466,6 +559,20 @@ class Pipeline(LightningModule):
         return sigma
 
     def get_timestep(self, bsz, device):
+        """
+        根据指定的批量大小（bsz）和设备（device）采样时间步索引，并返回相应的时间步张量。
+
+        如果 self.hparams.timestep_densities_type 为 "logit_normal"，则按照 SD3 论文 3.1 节的方法，
+        从正态分布 N(mean, std) 采样随机变量 u，并通过标准 logistic 函数（sigmoid）映射到 (0, 1) 区间。
+        然后将其缩放到训练步数范围，得到时间步索引，并返回对应的 scheduler 时间步张量。
+
+        参数:
+            bsz (int): 批量大小。
+            device (torch.device 或 str): 返回张量所需的设备。
+
+        返回:
+            torch.Tensor: 采样得到的时间步张量，形状为 (bsz,)。
+        """
         if self.hparams.timestep_densities_type == "logit_normal":
             # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
             # In practice, we sample the random variable u from a normal distribution u ∼ N (u; m, s)
@@ -486,6 +593,24 @@ class Pipeline(LightningModule):
         return timesteps
 
     def run_step(self, batch, batch_idx):
+        """
+        执行模型的单步训练。
+
+        本方法处理一个批次的数据，对目标特征添加噪声用于flow-matching，预测去噪输出，
+        计算损失（包括SSL约束的投影损失），记录相关指标，并返回总损失。
+
+        参数:
+            batch (dict 或 Tensor): 包含训练所需数据的批次，如目标特征、注意力掩码、编码器隐藏状态、
+            说话人嵌入、歌词token ID和SSL隐藏状态等。
+            batch_idx (int): 当前批次的索引。
+
+        返回:
+            torch.Tensor: 当前训练步的损失。
+
+        影响:
+            - 使用 `self.log` 记录各种指标（去噪损失、投影损失、总损失、学习率）。
+            - 可选地调用 `self.plot_step` 绘制当前步结果。
+        """
         self.plot_step(batch, batch_idx)
         (
             keys,
@@ -627,6 +752,28 @@ class Pipeline(LightningModule):
         guidance_scale=15.0,
         omega_scale=10.0,
     ):
+        """
+        执行扩散过程以生成目标潜变量（latents）。
+
+        参数:
+            duration (float): 输入音频的时长（秒）。
+            encoder_text_hidden_states (torch.Tensor): 文本编码器的隐藏状态张量。
+            text_attention_mask (torch.Tensor): 文本注意力掩码。
+            speaker_embds (torch.Tensor): 说话人嵌入张量。
+            lyric_token_ids (torch.Tensor): 歌词token的ID张量。
+            lyric_mask (torch.Tensor): 歌词掩码张量。
+            random_generators (Optional[Any]): 用于生成随机噪声的生成器（可选）。
+            infer_steps (int, 默认=60): 推理步数。
+            guidance_scale (float, 默认=15.0): classifier-free guidance的引导系数。
+            omega_scale (float, 默认=10.0): scheduler步进时的omega参数。
+
+        返回:
+            torch.Tensor: 生成的目标潜变量张量。
+
+        说明:
+            该方法实现了基于扩散模型的采样过程，支持classifier-free guidance。通过多步迭代，逐步去噪生成目标潜变量。
+            适用于语音、音乐等生成任务。
+        """
 
         do_classifier_free_guidance = True
         if guidance_scale == 0.0 or guidance_scale == 1.0:
@@ -775,6 +922,23 @@ class Pipeline(LightningModule):
         return lyrics
 
     def plot_step(self, batch, batch_idx):
+        """
+        执行模型评估步骤时，保存目标音频、预测音频及相关文本信息。
+
+        参数:
+            batch: 当前批次的数据。
+            batch_idx: 当前批次的索引。
+
+        功能:
+            - 每隔指定步数（由 self.hparams.every_plot_step 控制）执行一次。
+            - 仅在主进程和主GPU上执行（local_rank、分布式rank、CUDA设备均为0）。
+            - 调用 predict_step 获取预测结果，包括目标音频、预测音频、关键字、提示、歌词片段、采样率和随机种子。
+            - 对每个样本，构建歌词文本，保存目标音频和预测音频为 .wav 文件，并保存关键信息为 .txt 文件。
+            - 所有文件保存在 log_dir/eval_results/step_{global_step} 目录下。
+
+        注意:
+            需要 torchaudio 和 os 库支持音频保存与目录操作。
+        """
         global_step = self.global_step
         if (
             global_step % self.hparams.every_plot_step != 0

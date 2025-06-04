@@ -66,6 +66,18 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return audio, sr
 
     def forward_mel(self, audios):
+        """
+        对输入的音频张量列表进行梅尔频谱变换。
+
+        参数:
+            audios (list or torch.Tensor): 包含音频数据的列表或张量，每个元素为单个音频样本。
+
+        返回:
+            torch.Tensor: 堆叠后的梅尔频谱张量，形状为 (batch_size, ...)，每个元素对应一个输入音频的梅尔频谱。
+
+        说明:
+            该方法遍历输入的音频数据，使用 self.vocoder.mel_transform 对每个音频进行梅尔频谱变换，并将结果堆叠为一个张量返回。
+        """
         mels = []
         for i in range(len(audios)):
             image = self.vocoder.mel_transform(audios[i])
@@ -83,6 +95,7 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         device = audios.device
         dtype = audios.dtype
 
+        # 重采样成 44100Hz
         if sr is None:
             sr = 48000
             resampler = self.resampler
@@ -97,12 +110,13 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 audio, (0, 8 * 512 - max_audio_len % (8 * 512))
             )
 
-        mels = self.forward_mel(audio)
+        # 转换为梅尔频谱图
+        mels = self.forward_mel(audio)  # 在时间上移动计算窗口，帧移为512，表示滑动窗口步长
         mels = (mels - self.min_mel_value) / (self.max_mel_value - self.min_mel_value)
         mels = self.transform(mels)
         latents = []
         for mel in mels:
-            latent = self.dcae.encoder(mel.unsqueeze(0))
+            latent = self.dcae.encoder(mel.unsqueeze(0))    # encoder再下采样8倍
             latents.append(latent)
         latents = torch.cat(latents, dim=0)
         latent_lengths = (
@@ -118,12 +132,13 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         pred_wavs = []
 
         for latent in latents:
-            mels = self.dcae.decoder(latent.unsqueeze(0))
+            mels = self.dcae.decoder(latent.unsqueeze(0))   # torch.Size([8, 16, 1776]) -> torch.Size([2, 128, 1776])
             mels = mels * 0.5 + 0.5
             mels = mels * (self.max_mel_value - self.min_mel_value) + self.min_mel_value
 
             # wav = self.vocoder.decode(mels[0]).squeeze(1)
             # decode waveform for each channels to reduce vram footprint
+            # 将梅尔频谱图转换为波形
             wav_ch1 = self.vocoder.decode(mels[:,0,:,:]).squeeze(1).cpu()
             wav_ch2 = self.vocoder.decode(mels[:,1,:,:]).squeeze(1).cpu()
             wav = torch.cat([wav_ch1, wav_ch2],dim=0)
